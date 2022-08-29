@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <wayland-server-core.h>
 #include <wlr/backend.h>
+#include <wlr/render/allocator.h>
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_compositor.h>
@@ -32,6 +33,7 @@ struct TFWCServer {
     struct wlr_xdg_shell *xdgShell;
     struct wl_listener newXdgWindow;
     struct wl_list views;
+    struct wlr_allocator *allocator;
 
     struct wlr_cursor *cursor;
     struct wlr_xcursor_manager *cursorManager;
@@ -40,6 +42,9 @@ struct TFWCServer {
     struct wl_listener cursorButton;
     struct wl_listener cursorAxis;
     struct wl_listener cursorFrame;
+    double grabedX, grabedY;
+    struct TFWCView *grabbedView;
+    struct wlr_box grabGeobox;
 
     struct wlr_seat *seat;
     struct wl_listener newInput;
@@ -80,6 +85,13 @@ struct TFWCView {
     int x, y;
 };
 
+struct renderData {
+	struct wlr_output *output;
+	struct wlr_renderer *renderer;
+	struct TFWCView *view;
+	struct timespec *when;
+};
+
 //helper functions
 
 //function to check if a window is at a coordinate
@@ -102,7 +114,7 @@ static bool view_at(struct TFWCView *view, double lx, double ly, struct wlr_surf
 static struct TFWCView *desktop_view_at(
     struct TFWCServer *server, double lx, double ly,
     struct wlr_surface **surface, double *sx, double *sy) {
-    struct TFWMView *view;
+    struct TFWCView *view;
     wl_list_for_each(view, &server->views, link) {
         if (view_at(view, lx, ly, surface, sx, sy)) {
             return view;
@@ -112,13 +124,13 @@ static struct TFWCView *desktop_view_at(
 }
 
 //setter for window position
-void setWindowPosition(struct TFWMView *view, int x, int y) {
-    view.x = x;
-    view.y = y;
+void setWindowPosition(struct TFWCView *view, int x, int y) {
+    view->x = x;
+    view->y = y;
 }
 
 //setter for window size
-void setWindowSize(struct TFWMView *view, int w, int h) {
+void setWindowSize(struct TFWCView *view, int w, int h) {
     struct wlr_box geo_box;
     wlr_xdg_surface_get_geometry(view->xdgSurface, &geo_box);
     wlr_xdg_toplevel_set_size(view->xdgSurface, w, h);
@@ -148,7 +160,9 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
 
     //all events get passed to the focused program if your key isnt held down for compositor keybinds
     if(modifiers & compositorKey) {
-        //handle compositor keybinds here
+        if (fork() == 0) {
+	    execl("/bin/sh", "/bin/sh", "-c", "st", (void *)NULL);
+        }
     } else {
         //all other keypresses get sent to the current program
         wlr_seat_set_keyboard(seat, keyboard->device);
@@ -182,7 +196,7 @@ static void focus_view(struct TFWCView *view, struct wlr_surface *surface) {
 
 //handle clipboard setting requests
 static void seatRequestSetSelection(struct wl_listener *listener, void *data) {
-    struct TFWMServer *server = wl_container_of(listener, server, requestSetSelection);
+    struct TFWCServer *server = wl_container_of(listener, server, requestSetSelection);
     struct wlr_seat_request_set_selection_event *event = data;
     wlr_seat_set_selection(server->seat, event->source, event->serial);
 }
@@ -202,7 +216,7 @@ static void processCursorMotion(struct TFWCServer *server, uint32_t time) {
     double sx, sy;
     struct wlr_seat *seat = server->seat;
     struct wlr_surface *surface = NULL;
-    struct TFWMView *view = desktop_view_at(server, server->cursor->x, server->cursor->y, &surface, &sx, &sy);
+    struct TFWCView *view = desktop_view_at(server, server->cursor->x, server->cursor->y, &surface, &sx, &sy);
     if (!view) { //if cursor isnt over a window will it default to the normal pointer
         wlr_xcursor_manager_set_cursor_image(server->cursorManager, "left_ptr", server->cursor);
     }
@@ -216,7 +230,7 @@ static void processCursorMotion(struct TFWCServer *server, uint32_t time) {
 
 //handle relative cursor movement envents
 static void serverCursorMotion(struct wl_listener *listener, void *data) {
-    struct TFWMServer *server = wl_container_of(listener, server, cursorMotion);
+    struct TFWCServer *server = wl_container_of(listener, server, cursorMotion);
     struct wlr_event_pointer_motion *event = data;
     wlr_cursor_move(server->cursor, event->device, event->delta_x, event->delta_y);
     processCursorMotion(server, event->time_msec);
@@ -232,7 +246,7 @@ static void serverCursorMotionAbsolute(struct wl_listener *listener, void *data)
 
 //handle mouse clicks
 static void serverCursorButton(struct wl_listener *listener, void *data) {
-    struct TFWMServer *server = wl_container_of(listener, server, cursorButton);
+    struct TFWCServer *server = wl_container_of(listener, server, cursorButton);
     struct wlr_event_pointer_button *event = data;
     wlr_seat_pointer_notify_button(server->seat, event->time_msec, event->button, event->state);
     double sx, sy;
@@ -243,7 +257,7 @@ static void serverCursorButton(struct wl_listener *listener, void *data) {
 
 //handle frame events
 static void serverCursorFrame(struct wl_listener *listener, void *data) {
-    struct TFWMServer *server = wl_container_of(listener, server, cursorFrame);
+    struct TFWCServer *server = wl_container_of(listener, server, cursorFrame);
     wlr_seat_pointer_notify_frame(server->seat);
 }
 
@@ -258,7 +272,7 @@ static void serverCursorAxis(struct wl_listener *listener, void *data) {
 
 //main window rendering function
 static void renderWindow(struct wlr_surface *surface, int sx, int sy, void *data) {
-    struct render_data *rdata = data;
+    struct renderData *rdata = data;
     struct TFWCView *view = rdata->view;
     struct wlr_output *output = rdata->output;
 
@@ -312,7 +326,7 @@ static void renderScreen(struct wl_listener *listener, void *data) {
     struct TFWCView *view;
     wl_list_for_each_reverse(view, &output->server->views, link) {
         if(!view->mapped) continue;
-        struct render_data rdata = {
+        struct renderData rdata = {
                 .output = output->wlrOutput,
                 .view = view,
                 .renderer = renderer,
@@ -353,9 +367,9 @@ static void xdgHandleToplevelMoveRequest(struct wl_listener *listener, void *dat
     struct TFWCServer *server = view->server;
     struct wlr_surface *focused_surface = server->seat->pointer_state.focused_surface;
     if(view->xdgSurface->surface != focused_surface) return;
-    server->grabbed_view = view;
-    server->grab_x = server->cursor->x - view->x;
-    server->grab_y = server->cursor->y - view->y;
+    server->grabbedView = view;
+    server->grabedX = server->cursor->x - view->x;
+    server->grabedY = server->cursor->y - view->y;
 }
 
 //called when a window tries to resize it self
@@ -365,17 +379,14 @@ static void xdgHandleToplevelResizeRequest(struct wl_listener *listener, void *d
     struct TFWCServer *server = view->server;
     struct wlr_surface *focused_surface = server->seat->pointer_state.focused_surface;
     if(view->xdgSurface->surface != focused_surface) return;
-    server->grabbed_view = view;
+    server->grabbedView = view;
     struct wlr_box geo_box;
     wlr_xdg_surface_get_geometry(view->xdgSurface, &geo_box);
-    double border_x = (view->x + geo_box.x) + ((edges & WLR_EDGE_RIGHT) ? geo_box.width : 0);
-    double border_y = (view->y + geo_box.y) + ((edges & WLR_EDGE_BOTTOM) ? geo_box.height : 0);
-    server->grab_x = server->cursor->x - border_x;
-    server->grab_y = server->cursor->y - border_y;
-    server->grab_geobox = geo_box;
-    server->grab_geobox.x += view->x;
-    server->grab_geobox.y += view->y;
-    server->resize_edges = edges;
+    server->grabedX = server->cursor->x;
+    server->grabedY = server->cursor->y;
+    server->grabGeobox = geo_box;
+    server->grabGeobox.x += view->x;
+    server->grabGeobox.y += view->y;
 }
 
 //called when a new window is started
@@ -385,7 +396,7 @@ static void serverNewWindow(struct wl_listener *listener, void *data) {
     if(xdgSurface->role != WLR_XDG_SURFACE_ROLE_TOPLEVEL) return;
 
     //alocate window to memory
-    struct TFWiew *view = calloc(1, sizeof(struct TFWCView));
+    struct TFWCView *view = calloc(1, sizeof(struct TFWCView));
     view->server = server;
     view->xdgSurface = xdgSurface;
 
@@ -398,9 +409,9 @@ static void serverNewWindow(struct wl_listener *listener, void *data) {
     wl_signal_add(&xdgSurface->events.destroy, &view->destroy);
     struct wlr_xdg_toplevel *toplevel = xdgSurface->toplevel;
     view->requestMove.notify = xdgHandleToplevelMoveRequest;
-    wl_signal_add(&toplevel->events.requestMove, &view->request_move);
+    wl_signal_add(&toplevel->events.request_move, &view->requestMove);
     view->requestResize.notify = xdgHandleToplevelResizeRequest;
-    wl_signal_add(&toplevel->events.requestResize, &view->requestResize);
+    wl_signal_add(&toplevel->events.request_resize, &view->requestResize);
 
     //Add it to the list of views.
     wl_list_insert(&server->views, &view->link);
@@ -412,6 +423,8 @@ static void serverNewWindow(struct wl_listener *listener, void *data) {
 static void serverNewOutput(struct wl_listener *listener, void *data) {
     struct TFWCServer *server = wl_container_of(listener, server, newOutput);
     struct wlr_output *wlrOutput = data;
+
+	wlr_output_init_render(wlrOutput, server->allocator, server->renderer);
 
     //setting monitor modes
     if(!wl_list_empty(&wlrOutput->modes)) {
@@ -488,8 +501,9 @@ int main(int argc, char *argv[]) {
     struct TFWCServer server;
     server.display = wl_display_create();
     server.backend = wlr_backend_autocreate(server.display);
-    server.renderer = wlr_backend_get_renderer(server.backend);
+    server.renderer = wlr_renderer_autocreate(server.backend);
     wlr_renderer_init_wl_display(server.renderer, server.display);
+    server.allocator = wlr_allocator_autocreate(server.backend, server.renderer);
     wlr_compositor_create(server.display, server.renderer);
     wlr_data_device_manager_create(server.display);
 
@@ -497,13 +511,11 @@ int main(int argc, char *argv[]) {
     server.outputLayout = wlr_output_layout_create();
     wl_list_init(&server.outputs);
     server.newOutput.notify = serverNewOutput;
-    wl_signal_add(&server.backend->events.newOutput, &server.newOutput);
-    
+    wl_signal_add(&server.backend->events.new_output, &server.newOutput);
+
     //new window listener
-    server.scene = wlr_scene_create();
-    wlr_scene_attach_output_layout(server.scene, server.outputLayout);
     wl_list_init(&server.views);
-    server.xdgShell = wlr_xdg_shell_create(server.display, 3);
+    server.xdgShell = wlr_xdg_shell_create(server.display);
     server.newXdgWindow.notify = serverNewWindow;
     wl_signal_add(&server.xdgShell->events.new_surface, &server.newXdgWindow);
 
@@ -526,12 +538,12 @@ int main(int argc, char *argv[]) {
     //setup keyboard event stuff
     wl_list_init(&server.keyboards);
     server.newInput.notify = serverNewInput;
-    wl_signal_add(&server.backend->events.newInput, &server.new_input);
+    wl_signal_add(&server.backend->events.new_input, &server.newInput);
     server.seat = wlr_seat_create(server.display, "seat0");
     server.requestCursor.notify = seatRequestCursor;
     wl_signal_add(&server.seat->events.request_set_cursor, &server.requestCursor);
     server.requestSetSelection.notify = seatRequestSetSelection;
-    wl_signal_add(&server.seat->events.requestSetSelection, &server.requestSetSelection);
+    wl_signal_add(&server.seat->events.request_set_selection, &server.requestSetSelection);
 
     const char *socket = wl_display_add_socket_auto(server.display);
     if (!socket) {
